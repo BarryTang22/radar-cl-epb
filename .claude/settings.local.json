@@ -7,7 +7,10 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:intellabs.github.io)",
-      "WebFetch(domain:en.wikipedia.org)"
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:openaccess.thecvf.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:research.google)"
     ]
   }
 }
