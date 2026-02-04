@@ -16,7 +16,7 @@ from collections import defaultdict
 from PIL import Image
 
 # Configure this to point to your datasets folder
-DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'radar', 'datasets')
+DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'radar', 'datasets')
 
 
 def get_files_from_folders(folders):

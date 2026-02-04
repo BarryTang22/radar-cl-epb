@@ -50,15 +50,14 @@ class ResNet18(nn.Module):
                 self.backbone.conv1.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
 
         in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(in_features, num_classes)
-        )
+        self.backbone.fc = nn.Identity()  # Remove backbone's fc
+        self.fc_dropout = nn.Dropout(0.5)
+        self.classifier = nn.Linear(in_features, num_classes)
 
     def freeze_backbone(self):
-        """Freeze all layers except final fc."""
-        for name, param in self.backbone.named_parameters():
-            if 'fc' not in name:
+        """Freeze all layers except classifier."""
+        for name, param in self.named_parameters():
+            if 'classifier' not in name:
                 param.requires_grad = False
 
     def unfreeze_backbone(self):
@@ -82,7 +81,9 @@ class ResNet18(nn.Module):
 
     def forward(self, x, prompts=None, adapter=None):
         """Forward pass. prompts and adapter args for CL method compatibility."""
-        return self.backbone(x)
+        features = self.get_features(x)
+        x = self.fc_dropout(features)
+        return self.classifier(x)
 
 
 class RadarTransformer(nn.Module):
@@ -166,16 +167,19 @@ class RadarTransformer(nn.Module):
         )
         self.temporal_transformer = nn.TransformerEncoder(temporal_layer, num_layers=temporal_layers)
 
-        self.classifier = nn.Sequential(
+        self.pre_classifier = nn.Sequential(
             nn.LayerNorm(embed_dim),
-            nn.Dropout(0.5),
-            nn.Linear(embed_dim, num_classes),
+            nn.Dropout(dropout),
         )
+        self.classifier = nn.Linear(embed_dim, num_classes)
 
     def freeze_backbone(self):
         """Freeze all parameters except classifier."""
         for name, param in self.named_parameters():
-            if 'classifier' not in name:
+            # Only keep classifier trainable, not pre_classifier
+            if name.startswith('classifier.'):
+                param.requires_grad = True
+            else:
                 param.requires_grad = False
 
     def unfreeze_backbone(self):
@@ -269,4 +273,5 @@ class RadarTransformer(nn.Module):
             adapter: Optional adapter module for EASE
         """
         features = self.get_features(x, prompts, adapter)
+        features = self.pre_classifier(features)
         return self.classifier(features)

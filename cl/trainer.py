@@ -21,42 +21,27 @@ TRANSFORMER_MODELS = ['RadarCubeTransformer', 'PromptVoxelTransformer']
 
 def get_incremental_classifier(model):
     """Get the IncrementalClassifier from a model."""
+    # Primary: model.classifier (ResNet18 and RadarTransformer)
+    if hasattr(model, 'classifier') and isinstance(model.classifier, IncrementalClassifier):
+        return model.classifier
+    # Fallbacks for other architectures
     if hasattr(model, 'fc') and isinstance(model.fc, IncrementalClassifier):
         return model.fc
     if hasattr(model, 'head') and isinstance(model.head, IncrementalClassifier):
         return model.head
-    if hasattr(model, 'backbone'):
-        if hasattr(model.backbone, 'classifier'):
-            if isinstance(model.backbone.classifier, IncrementalClassifier):
-                return model.backbone.classifier
-            if isinstance(model.backbone.classifier, nn.Sequential):
-                for layer in model.backbone.classifier:
-                    if isinstance(layer, IncrementalClassifier):
-                        return layer
-        if hasattr(model.backbone, 'fc') and isinstance(model.backbone.fc, IncrementalClassifier):
-            return model.backbone.fc
     return None
 
 
 def get_feature_dim(model):
     """Get the feature dimension before the classifier."""
+    if hasattr(model, 'classifier'):
+        if isinstance(model.classifier, nn.Linear):
+            return model.classifier.in_features
+        if isinstance(model.classifier, IncrementalClassifier):
+            return model.classifier.in_features
     if hasattr(model, 'embed_dim'):
         return model.embed_dim
-    if hasattr(model, 'backbone'):
-        if hasattr(model.backbone, 'classifier'):
-            for layer in model.backbone.classifier.modules():
-                if isinstance(layer, nn.Linear):
-                    return layer.in_features
-                if isinstance(layer, IncrementalClassifier):
-                    return layer.in_features
-    if hasattr(model, 'backbone'):
-        if hasattr(model.backbone, 'fc'):
-            for layer in model.backbone.fc.modules():
-                if isinstance(layer, nn.Linear):
-                    return layer.in_features
-                if isinstance(layer, IncrementalClassifier):
-                    return layer.in_features
-    return 128
+    return 512  # ResNet18 default
 
 
 def get_classifier_module(model):
@@ -80,27 +65,18 @@ def get_classifier_module(model):
 
 def make_incremental_model(model, device):
     """Replace the final classifier with IncrementalClassifier."""
+    # Primary: model.classifier as nn.Linear (ResNet18 and RadarTransformer)
+    if hasattr(model, 'classifier') and isinstance(model.classifier, nn.Linear):
+        in_features = model.classifier.in_features
+        model.classifier = IncrementalClassifier(in_features, initial_classes=0).to(device)
+        return model
+    # Fallbacks for other model architectures
     if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
         in_features = model.fc.in_features
         model.fc = IncrementalClassifier(in_features, initial_classes=0).to(device)
     elif hasattr(model, 'head') and isinstance(model.head, nn.Linear):
         in_features = model.head.in_features
         model.head = IncrementalClassifier(in_features, initial_classes=0).to(device)
-    elif hasattr(model, 'backbone'):
-        if hasattr(model.backbone, 'classifier'):
-            if isinstance(model.backbone.classifier, nn.Sequential):
-                for i, layer in reversed(list(enumerate(model.backbone.classifier))):
-                    if isinstance(layer, nn.Linear):
-                        in_features = layer.in_features
-                        model.backbone.classifier[i] = IncrementalClassifier(in_features, 0).to(device)
-                        break
-            elif isinstance(model.backbone.classifier, nn.Linear):
-                in_features = model.backbone.classifier.in_features
-                model.backbone.classifier = IncrementalClassifier(in_features, 0).to(device)
-        elif hasattr(model.backbone, 'fc'):
-            if isinstance(model.backbone.fc, nn.Linear):
-                in_features = model.backbone.fc.in_features
-                model.backbone.fc = IncrementalClassifier(in_features, 0).to(device)
     return model
 
 

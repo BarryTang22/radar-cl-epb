@@ -26,9 +26,15 @@ radar-cl is a Python package providing unified implementations of radar datasets
 ## Architecture
 
 ### Module Structure
-- `datasets.py` - Dataset classes and data loaders for 5 radar modalities
-- `models.py` - Two model architectures: ResNet18 (2D) and RadarTransformer (4D)
-- `__init__.py` - Package exports
+- `datasets/` - Dataset classes and data loaders
+  - `__init__.py` - Re-exports all datasets and utilities
+  - `single.py` - Single-modality datasets (DMM, DRC, CI4R, RadHAR, DIAT)
+  - `fusion.py` - FusionDataset for DMM+DRC multi-modal fusion
+- `models/` - Model architectures
+  - `__init__.py` - Re-exports all models
+  - `single.py` - ResNet18 (2D) and RadarTransformer (4D)
+  - `fusion.py` - RangeAlignedFusionModel and GatedRangeAlignedFusionModel
+- `__init__.py` - Package exports (imports from datasets/ and models/)
 - `cl/` - Continual Learning module
   - `__init__.py` - Exports all CL methods and utilities
   - `utils.py` - IncrementalClassifier, TaskTracker, CosineLinear, EASEAdapter
@@ -54,6 +60,14 @@ radar-cl is a Python package providing unified implementations of radar datasets
 - Supports prompt injection for continual learning methods (L2P, DualPrompt, etc.)
 - Methods: `freeze_backbone()`, `unfreeze_backbone()`, `get_features()`, `get_query()`
 
+**RangeAlignedFusionModel** (~892K params): For fused DMM+DRC data
+- Fuses DMM Doppler features with DRC angular tokens at matching range bins
+- DMM → CNN → per-range embeddings (B, 25, embed_dim)
+- DRC → per-range angular projection (B, T, 25, embed_dim)
+- Spatial transformer over range tokens + temporal transformer
+- Methods: `freeze_backbone()`, `unfreeze_backbone()`, `get_features()` (128-dim)
+- Variant: `GatedRangeAlignedFusionModel` adds learnable per-range gating
+
 ### Dataset-Model Mapping
 
 | Dataset | Model | Input Shape | Classes |
@@ -61,6 +75,7 @@ radar-cl is a Python package providing unified implementations of radar datasets
 | DMM | ResNet18(in_channels=1) | (B, 1, 21, 77) | 4 |
 | DMM (image) | ResNet18(in_channels=3) | (B, 3, 224, 224) | 4 |
 | DRC | RadarTransformer(spatial_encoder='linear') | (B, 21, 5, 5, 25) | 4 |
+| DMM+DRC | RangeAlignedFusionModel | DMM: (B, 1, 21, 77), DRC: (B, 21, 5, 5, 25) | 4 |
 | CI4R | ResNet18(in_channels=1) | (B, 1, 128, 128) | 11 |
 | RadHAR | RadarTransformer(spatial_encoder='conv3d') | (B, 60, 10, 32, 32) | 5 |
 | DIAT | ResNet18(in_channels=1) | (B, 1, 224, 224) | 6 |
@@ -68,7 +83,7 @@ radar-cl is a Python package providing unified implementations of radar datasets
 ## Key Conventions
 
 ### Data Path Configuration
-`DATA_ROOT` in `datasets.py` points to `../radar/datasets/` - configure this for your environment.
+`DATA_ROOT` in `datasets/single.py` points to `../../radar/datasets/` - configure this for your environment.
 
 ### File Naming Pattern
 DMM/DRC files follow: `{participant_id}_{class_label}_{c}_{timestep}.npy`
@@ -82,6 +97,7 @@ DMM/DRC files follow: `{participant_id}_{class_label}_{c}_{timestep}.npy`
 
 ### DataLoader Factories
 - `create_dataloaders()`: DMM/DRC with participant or random split
+- `create_fusion_dataloaders()`: DMM+DRC fusion (scene 1 only) from `datasets/fusion.py`
 - `create_ci4r_dataloaders()`: CI4R multi-frequency data
 - `create_radhar_dataloaders()`: RadHAR voxel data
 - `create_diat_dataloaders()`: DIAT JPG images
