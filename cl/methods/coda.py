@@ -205,3 +205,4 @@ class CODAPrompt(nn.Module):
             'task_count': self.task_count,
             'n_tasks': self.n_tasks
         }
+
