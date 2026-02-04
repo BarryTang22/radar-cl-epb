@@ -56,9 +56,10 @@ radar-cl is a Python package providing unified implementations of radar datasets
 **RadarTransformer** (~11M params): For 4D volumetric radar data
 - `spatial_encoder='linear'`: For DRC radar cubes (T, V, H, R)
 - `spatial_encoder='conv3d'`: For RadHAR voxels (T, D, H, W)
-- Dual encoder: spatial transformer/conv + temporal transformer
-- Supports prompt injection for continual learning methods (L2P, DualPrompt, etc.)
+- Dual encoder: spatial transformer/conv + PrefixTransformerEncoder for temporal
+- Uses **prefix tuning** for prompt injection (prompts prepended to K/V in attention)
 - Methods: `freeze_backbone()`, `unfreeze_backbone()`, `get_features()`, `get_query()`
+- Prompts format: `{'key_prefixes': [...], 'value_prefixes': [...]}` with per-layer lists
 
 **RangeAlignedFusionModel** (~892K params): For fused DMM+DRC data
 - Fuses DMM Doppler features with DRC angular tokens at matching range bins
@@ -116,9 +117,9 @@ The `cl/` module provides 10 CL algorithms with a unified interface.
 | Replay | `derpp` | Dark Experience Replay++ |
 | Contrastive | `co2l` | Contrastive Continual Learning |
 | Adapter | `ease` | Expandable Subspace Ensemble (class-incremental only) |
-| Prompt | `l2p` | Learning to Prompt (transformer only) |
-| Prompt | `coda` | CODA-Prompt (transformer only) |
-| Prompt | `dualprompt` | DualPrompt (transformer only) |
+| Prompt | `l2p` | Learning to Prompt with prefix tuning (transformer only) |
+| Prompt | `coda` | CODA-Prompt with prefix tuning (transformer only) |
+| Prompt | `dualprompt` | DualPrompt with prefix tuning, G-Prompt for early layers, E-Prompt pool for later layers (transformer only) |
 
 ### Usage
 

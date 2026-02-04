@@ -13,6 +13,101 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class PrefixAttention(nn.Module):
+    """Multi-head attention with prefix tuning support.
+
+    Implements attention where prompts are prepended to Keys and Values,
+    following the DualPrompt paper's prefix tuning approach.
+    """
+
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x, key_prefix=None, value_prefix=None):
+        """Forward with optional K/V prefix prompts.
+
+        Args:
+            x: Input tensor (B, seq_len, embed_dim)
+            key_prefix: Optional key prefix (B, num_heads, prefix_len, head_dim)
+            value_prefix: Optional value prefix (B, num_heads, prefix_len, head_dim)
+        """
+        B, N, _ = x.shape
+
+        q = self.q_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if key_prefix is not None:
+            k = torch.cat([key_prefix, k], dim=2)
+        if value_prefix is not None:
+            v = torch.cat([value_prefix, v], dim=2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, N, self.embed_dim)
+        return self.out_proj(out)
+
+
+class PrefixTransformerLayer(nn.Module):
+    """Transformer encoder layer with prefix tuning support."""
+
+    def __init__(self, embed_dim, num_heads, dim_feedforward, dropout=0.1):
+        super().__init__()
+        self.self_attn = PrefixAttention(embed_dim, num_heads, dropout)
+        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x, key_prefix=None, value_prefix=None):
+        x = x + self.dropout1(self.self_attn(self.norm1(x), key_prefix, value_prefix))
+        x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(self.norm2(x))))))
+        return x
+
+
+class PrefixTransformerEncoder(nn.Module):
+    """Transformer encoder with layer-wise prefix tuning support."""
+
+    def __init__(self, embed_dim, num_heads, num_layers, dim_feedforward, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            PrefixTransformerLayer(embed_dim, num_heads, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+    def forward(self, x, key_prefixes=None, value_prefixes=None):
+        """Forward with optional layer-wise K/V prefixes.
+
+        Args:
+            x: Input (B, seq_len, embed_dim)
+            key_prefixes: Optional list of key prefixes per layer, each (B, num_heads, prefix_len, head_dim)
+            value_prefixes: Optional list of value prefixes per layer
+        """
+        for i, layer in enumerate(self.layers):
+            k_prefix = key_prefixes[i] if key_prefixes is not None else None
+            v_prefix = value_prefixes[i] if value_prefixes is not None else None
+            x = layer(x, k_prefix, v_prefix)
+        return x
+
+
 def sinusoidal_pos_encoding(seq_len, embed_dim):
     """Generate sinusoidal positional encoding for variable sequence lengths."""
     pos = torch.arange(seq_len).unsqueeze(1).float()
@@ -161,11 +256,12 @@ class RadarTransformer(nn.Module):
         else:
             raise ValueError(f"Unknown spatial_encoder: {spatial_encoder}")
 
-        temporal_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=nhead, dim_feedforward=embed_dim * 4,
-            dropout=dropout, batch_first=True
+        self.nhead = nhead
+        self.temporal_layers = temporal_layers
+        self.temporal_transformer = PrefixTransformerEncoder(
+            embed_dim=embed_dim, num_heads=nhead, num_layers=temporal_layers,
+            dim_feedforward=embed_dim * 4, dropout=dropout
         )
-        self.temporal_transformer = nn.TransformerEncoder(temporal_layer, num_layers=temporal_layers)
 
         self.pre_classifier = nn.Sequential(
             nn.LayerNorm(embed_dim),
@@ -227,13 +323,14 @@ class RadarTransformer(nn.Module):
         return x
 
     def get_features(self, x, prompts=None, adapter=None):
-        """Extract features with optional prompt injection.
+        """Extract features with optional prefix tuning prompt injection.
 
         Args:
             x: Input tensor
                - For 'linear': (B, T, V, H, R) radar cube
                - For 'conv3d': (B, T, D, H, W) voxels
-            prompts: Optional (B, P, embed_dim) prompts for temporal transformer
+            prompts: Optional dict with 'key_prefixes' and 'value_prefixes' for prefix tuning.
+                     Each is a list of (B, num_heads, prefix_len, head_dim) tensors per layer.
             adapter: Optional adapter module for EASE
         """
         if self.spatial_encoder_type == 'linear':
@@ -247,13 +344,11 @@ class RadarTransformer(nn.Module):
         x = x + temporal_pe.unsqueeze(0)
 
         if prompts is not None:
-            num_prompts = prompts.size(1)
-            x = torch.cat([prompts, x], dim=1)
-
-        x = self.temporal_transformer(x)
-
-        if prompts is not None:
-            x = x[:, num_prompts:]
+            key_prefixes = prompts.get('key_prefixes')
+            value_prefixes = prompts.get('value_prefixes')
+            x = self.temporal_transformer(x, key_prefixes, value_prefixes)
+        else:
+            x = self.temporal_transformer(x)
 
         x = x.mean(dim=1)
 
@@ -263,13 +358,13 @@ class RadarTransformer(nn.Module):
         return x
 
     def forward(self, x, prompts=None, adapter=None):
-        """Forward pass with optional prompt injection.
+        """Forward pass with optional prefix tuning prompt injection.
 
         Args:
             x: Input tensor
                - For 'linear': (B, T, V, H, R) radar cube
                - For 'conv3d': (B, T, D, H, W) voxels
-            prompts: Optional (B, P, embed_dim) prompts for temporal transformer
+            prompts: Optional dict with 'key_prefixes' and 'value_prefixes' for prefix tuning.
             adapter: Optional adapter module for EASE
         """
         features = self.get_features(x, prompts, adapter)
