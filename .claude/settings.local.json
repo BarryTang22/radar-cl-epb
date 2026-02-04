@@ -8,7 +8,9 @@
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:intellabs.github.io)",
       "WebFetch(domain:en.wikipedia.org)",
-      "Bash(dir:*)"
+      "WebFetch(domain:openaccess.thecvf.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:research.google)"
     ]
   }
 }

@@ -446,6 +446,8 @@ class CLTrainer:
             self.cl_params['coda'].update_task()
         elif self.algorithm == 'dualprompt' and 'dualprompt' in self.cl_params:
             self.cl_params['dualprompt'].update_task()
+        elif self.algorithm == 'l2p' and 'l2p' in self.cl_params:
+            self.cl_params['l2p'].update_task()
 
     def evaluate_all_tasks(self, test_loaders, task_classes_list):
         """Evaluate on all seen tasks.
