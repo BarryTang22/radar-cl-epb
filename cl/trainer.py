@@ -128,8 +128,17 @@ class CLTrainer:
             self.cl_params['buffer'] = BalancedDERPlusPlus(buffer_size=buffer_size, alpha=alpha, beta=beta)
         elif self.algorithm == 'co2l':
             proj_dim = self.config.get('proj_dim', 128)
-            temperature = self.config.get('temperature', 0.5)
-            self.cl_params['co2l'] = Co2L(self.feature_dim, proj_dim=proj_dim, temperature=temperature)
+            temperature = self.config.get('temperature', 0.07)  # Official default
+            current_temp = self.config.get('current_temp', 0.2)  # Official default
+            past_temp = self.config.get('past_temp', 0.01)  # Official default
+            distill_power = self.config.get('distill_power', 1.0)
+            supcon_weight = self.config.get('supcon_weight', 0.1)
+            self.cl_params['co2l'] = Co2L(
+                self.feature_dim, proj_dim=proj_dim, temperature=temperature,
+                current_temp=current_temp, past_temp=past_temp,
+                distill_power=distill_power, supcon_weight=supcon_weight,
+                buffer_size=buffer_size
+            )
             self.cl_params['co2l'].to(self.device)
         elif self.algorithm == 'ease':
             bottleneck_dim = self.config.get('bottleneck_dim', 32)
@@ -240,20 +249,31 @@ class CLTrainer:
             elif self.algorithm == 'derpp' and 'buffer' in self.cl_params:
                 loss += self.cl_params['buffer'].replay_loss(self.model, data.size(0), self.device, active_classes)
             elif self.algorithm == 'co2l' and 'co2l' in self.cl_params:
+                co2l = self.cl_params['co2l']
+                # Combine current batch with replay samples
+                combined_data, combined_labels, current_mask = co2l.get_combined_batch(data, labels, self.device)
+
+                # Get features for combined batch
                 if hasattr(self.model, 'get_features'):
-                    features = self.model.get_features(data)
+                    combined_features = self.model.get_features(combined_data)
                 else:
-                    features = outputs
-                loss += self.cl_params['co2l'].supcon_loss(features, labels)
-                if self.cl_params['co2l'].old_model is not None:
+                    combined_features = self.model(combined_data)
+
+                # Asymmetric SupCon loss (current samples as anchors, replay as negatives)
+                loss += co2l.supcon_weight * co2l.supcon_loss(combined_features, combined_labels, current_mask)
+
+                # IRD loss (only on current batch data for efficiency)
+                if co2l.old_model is not None:
+                    if hasattr(self.model, 'get_features'):
+                        current_features = self.model.get_features(data)
+                    else:
+                        current_features = outputs
                     with torch.no_grad():
-                        if hasattr(self.cl_params['co2l'].old_model, 'get_features'):
-                            old_features = self.cl_params['co2l'].old_model.get_features(data)
+                        if hasattr(co2l.old_model, 'get_features'):
+                            old_features = co2l.old_model.get_features(data)
                         else:
-                            old_features = self.cl_params['co2l'].old_model(data)
-                        old_outputs = self.cl_params['co2l'].old_model(data)
-                    loss += self.cl_params['co2l'].ird_loss(old_features, features)
-                    loss += self.cl_params['co2l'].classifier_distill_loss(old_outputs, outputs)
+                            old_features = co2l.old_model(data)
+                    loss += co2l.ird_loss(old_features, current_features)
 
             # Add prompt losses
             elif self.algorithm == 'l2p' and 'l2p' in self.cl_params:
@@ -437,8 +457,9 @@ class CLTrainer:
             alpha = self.config.get('lwf_alpha', 1.0)
             self.cl_params['lwf'] = LwF(self.model, temperature=temperature, alpha=alpha)
 
-        # Update Co2L old model
+        # Update Co2L: save model and add to buffer
         if self.algorithm == 'co2l' and 'co2l' in self.cl_params:
+            self.cl_params['co2l'].add_to_buffer(train_loader, task_classes)
             self.cl_params['co2l'].update_old_model(self.model)
 
         # Update prompt methods
