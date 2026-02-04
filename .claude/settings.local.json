@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(tree:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:intellabs.github.io)",
+      "WebFetch(domain:en.wikipedia.org)"
     ]
   }
 }

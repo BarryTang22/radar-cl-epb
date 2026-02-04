@@ -428,10 +428,13 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
 
         task_classes = task_info['classes']
 
+        # Set model-specific learning rate (transformers need lower lr)
+        lr = 1e-4 if model_name in TRANSFORMER_MODELS else 1e-3
+
         # Train on current task
         val_acc = trainer.train_task(
             task_idx, task_info['train'], task_info['val'],
-            task_classes, epochs=epochs
+            task_classes, epochs=epochs, lr=lr
         )
         print(f"    Val Acc: {val_acc:.2f}%")
 
