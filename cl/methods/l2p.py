@@ -1,25 +1,22 @@
-"""Learning to Prompt with prefix tuning."""
+"""Learning to Prompt - original prompt tuning (prepend to input)."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class L2P(nn.Module):
-    """Learning to Prompt for continual learning with prefix tuning.
+    """Learning to Prompt for continual learning.
 
     Paper: Wang et al. "Learning to Prompt for Continual Learning" (CVPR 2022)
     Official: https://github.com/google-research/l2p
 
     Uses a learnable prompt pool with key-query matching to select
-    task-relevant prompts. Implements prefix tuning where prompts are
-    prepended to Keys and Values in attention.
+    task-relevant prompts. Prompts are prepended to input sequence.
 
     Args:
         pool_size: Number of prompts in the pool (M in paper)
         prompt_length: Length of each prompt (L_p in paper)
         embed_dim: Embedding dimension
-        num_heads: Number of attention heads
-        num_layers: Number of transformer layers to attach prompts
         top_k: Number of prompts to select
     """
 
@@ -29,15 +26,11 @@ class L2P(nn.Module):
         self.pool_size = pool_size
         self.prompt_length = prompt_length
         self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.head_dim = embed_dim // num_heads
         self.top_k = top_k
 
-        # Prompt pool: (pool_size, num_layers, 2, prompt_length, num_heads, head_dim)
-        # 2 = key and value prefixes
+        # Prompt pool: (pool_size, prompt_length, embed_dim)
         self.prompt_pool = nn.Parameter(
-            torch.randn(pool_size, num_layers, 2, prompt_length, num_heads, self.head_dim) * 0.02
+            torch.randn(pool_size, prompt_length, embed_dim) * 0.02
         )
         self.prompt_keys = nn.Parameter(torch.randn(pool_size, embed_dim) * 0.02)
 
@@ -51,7 +44,7 @@ class L2P(nn.Module):
         """Select top-k prompts based on query similarity.
 
         Returns:
-            Dict with 'key_prefixes' and 'value_prefixes' lists for all layers.
+            Tensor of shape (B, top_k * prompt_length, embed_dim) to prepend to input.
         """
         query = F.normalize(query, dim=-1)
         keys = F.normalize(self.prompt_keys, dim=-1)
@@ -64,29 +57,13 @@ class L2P(nn.Module):
                     self.prompt_freq[idx] += 1
 
         batch_size = query.size(0)
-        # prompt_pool: (pool_size, num_layers, 2, prompt_length, num_heads, head_dim)
+        # prompt_pool: (pool_size, prompt_length, embed_dim)
         selected = self.prompt_pool[indices]
-        # selected: (B, top_k, num_layers, 2, prompt_length, num_heads, head_dim)
+        # selected: (B, top_k, prompt_length, embed_dim)
 
-        key_prefixes = []
-        value_prefixes = []
-        for layer_idx in range(self.num_layers):
-            # (B, top_k, prompt_length, num_heads, head_dim)
-            k = selected[:, :, layer_idx, 0]
-            v = selected[:, :, layer_idx, 1]
-            # Reshape to (B, top_k * prompt_length, num_heads, head_dim)
-            k = k.reshape(batch_size, -1, self.num_heads, self.head_dim)
-            v = v.reshape(batch_size, -1, self.num_heads, self.head_dim)
-            # Permute to (B, num_heads, total_prompt_length, head_dim)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            key_prefixes.append(k)
-            value_prefixes.append(v)
-
-        return {
-            'key_prefixes': key_prefixes,
-            'value_prefixes': value_prefixes
-        }
+        # Reshape to (B, top_k * prompt_length, embed_dim)
+        prompts = selected.reshape(batch_size, -1, self.embed_dim)
+        return prompts
 
     def get_prompt_loss(self, query):
         """Pull loss: encourage selected prompts to match query."""

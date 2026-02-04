@@ -323,14 +323,16 @@ class RadarTransformer(nn.Module):
         return x
 
     def get_features(self, x, prompts=None, adapter=None):
-        """Extract features with optional prefix tuning prompt injection.
+        """Extract features with optional prompt injection.
 
         Args:
             x: Input tensor
                - For 'linear': (B, T, V, H, R) radar cube
                - For 'conv3d': (B, T, D, H, W) voxels
-            prompts: Optional dict with 'key_prefixes' and 'value_prefixes' for prefix tuning.
-                     Each is a list of (B, num_heads, prefix_len, head_dim) tensors per layer.
+            prompts: Optional prompts in two formats:
+                     - Dict with 'key_prefixes' and 'value_prefixes': DualPrompt prefix tuning
+                       Each is a list of (B, num_heads, prefix_len, head_dim) tensors per layer.
+                     - Tensor (B, num_prompts, embed_dim): L2P/CODA prompt tuning (prepend to input)
             adapter: Optional adapter module for EASE
         """
         if self.spatial_encoder_type == 'linear':
@@ -344,9 +346,17 @@ class RadarTransformer(nn.Module):
         x = x + temporal_pe.unsqueeze(0)
 
         if prompts is not None:
-            key_prefixes = prompts.get('key_prefixes')
-            value_prefixes = prompts.get('value_prefixes')
-            x = self.temporal_transformer(x, key_prefixes, value_prefixes)
+            if isinstance(prompts, dict):
+                # DualPrompt prefix tuning: prepend to K/V in attention
+                key_prefixes = prompts.get('key_prefixes')
+                value_prefixes = prompts.get('value_prefixes')
+                x = self.temporal_transformer(x, key_prefixes, value_prefixes)
+            else:
+                # L2P/CODA prompt tuning: prepend to input sequence
+                num_prompts = prompts.size(1)
+                x = torch.cat([prompts, x], dim=1)
+                x = self.temporal_transformer(x)
+                x = x[:, num_prompts:]  # Remove prompt tokens from output
         else:
             x = self.temporal_transformer(x)
 

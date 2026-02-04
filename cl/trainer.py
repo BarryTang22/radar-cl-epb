@@ -221,16 +221,20 @@ class CLTrainer:
                     backbone_features = backbone_features.detach()
                 outputs = self.cl_params['ease'](backbone_features, training=True)
 
-            # Handle prompt-based methods (query has gradients for key-query learning)
+            # Handle prompt-based methods
             elif self.algorithm in ['l2p', 'coda', 'dualprompt'] and hasattr(self.model, 'get_query'):
-                query = self.model.get_query(data)
-
-                if self.algorithm == 'l2p':
-                    prompts = self.cl_params['l2p'].select_prompts(query)
-                elif self.algorithm == 'coda':
-                    prompts = self.cl_params['coda'].get_prompt(query)
-                elif self.algorithm == 'dualprompt':
+                # DualPrompt needs query gradients for key-query learning
+                # L2P/CODA use frozen query for prompt selection
+                if self.algorithm == 'dualprompt':
+                    query = self.model.get_query(data)
                     prompts = self.cl_params['dualprompt'].get_prompt(query)
+                else:
+                    with torch.no_grad():
+                        query = self.model.get_query(data)
+                    if self.algorithm == 'l2p':
+                        prompts = self.cl_params['l2p'].select_prompts(query)
+                    elif self.algorithm == 'coda':
+                        prompts = self.cl_params['coda'].get_prompt(query)
 
                 outputs = self.model(data, prompts=prompts)
             else:
