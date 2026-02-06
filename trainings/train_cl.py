@@ -337,7 +337,7 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         print(f"\nSkipping EASE for {dataset_name}/{setting} - EASE is designed for class-incremental only")
         return None
 
-    # Skip prompt-based methods for CNN models
+    # Skip prompt-based methods for CNN models (EPB gracefully degrades to HEC-only for CNNs)
     if algorithm in ['l2p', 'coda', 'dualprompt'] and model_name not in TRANSFORMER_MODELS:
         print(f"\nSkipping {algorithm} for {dataset_name} - {algorithm} requires transformer model, got {model_name}")
         return None
@@ -406,13 +406,24 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         'temperature': 0.5,
         'bottleneck_dim': 32,
         'ease_alpha': 0.1,
-        'pool_size': 20 if algorithm == 'l2p' else 100,
-        'prompt_length': 5 if algorithm in ['l2p', 'dualprompt'] else 8,
+        'pool_size': 20 if algorithm in ['l2p', 'epb'] else 100,
+        'prompt_length': 5 if algorithm in ['l2p', 'dualprompt', 'epb'] else 8,
         'top_k': 5,
         'ortho_weight': 0.1,
         'g_prompt_length': 5,
         'e_pool_size': 10,
         'n_tasks': n_tasks,
+        # EPB hyperparameters
+        'epb_prompt_type': 'l2p',
+        'use_hec': True,
+        'use_pcf': True,
+        'use_fal': False,
+        'epb_ewc_lambda': 500,
+        'epb_fisher_ema': 0.7,
+        'num_anchors_per_class': 10,
+        'anchor_margin': 0.5,
+        'fal_lambda': 0.1,
+        'epb_use_replay': False,
     }
 
     trainer = CLTrainer(model, algorithm, device, cl_config)
@@ -444,6 +455,9 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         if algorithm in ['l2p', 'coda', 'dualprompt']:
             prompt_method = algorithm
             prompt_module = trainer.cl_params.get(algorithm)
+        elif algorithm == 'epb' and 'epb' in trainer.cl_params:
+            prompt_method = 'epb'
+            prompt_module = trainer.cl_params['epb'].prompt_method
 
         # Evaluate on all tasks seen so far
         for j in range(task_idx + 1):

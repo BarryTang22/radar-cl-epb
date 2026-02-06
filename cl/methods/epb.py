@@ -17,6 +17,8 @@ from collections import defaultdict
 DEFAULT_LAYER_SCALES = {
     'range_proj': 2.0,
     'spatial_transformer': 1.5,
+    'spatial_conv': 1.5,
+    'spatial_fc': 1.5,
     'temporal_transformer': 0.5,
     'classifier': 0.3,
 }
@@ -24,6 +26,8 @@ DEFAULT_LAYER_SCALES = {
 UNIFORM_LAYER_SCALES = {
     'range_proj': 1.0,
     'spatial_transformer': 1.0,
+    'spatial_conv': 1.0,
+    'spatial_fc': 1.0,
     'temporal_transformer': 1.0,
     'classifier': 1.0,
 }
@@ -31,6 +35,8 @@ UNIFORM_LAYER_SCALES = {
 INVERSE_LAYER_SCALES = {
     'range_proj': 0.3,
     'spatial_transformer': 0.5,
+    'spatial_conv': 0.5,
+    'spatial_fc': 0.5,
     'temporal_transformer': 1.5,
     'classifier': 2.0,
 }
@@ -61,6 +67,7 @@ class HierarchicalEWC:
 
     def compute_fisher(self, model, dataloader, device, prompt_method=None):
         """Compute Fisher Information with optional prompt conditioning."""
+        was_training = model.training
         model.eval()
         new_fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters()
                       if p.requires_grad}
@@ -106,6 +113,9 @@ class HierarchicalEWC:
                        if p.requires_grad}
         self.param_scales = {n: self._get_layer_scale(n) for n in self.params}
 
+        if was_training:
+            model.train()
+
     def penalty(self, model):
         """Compute hierarchical EWC penalty."""
         if not self.fisher:
@@ -149,6 +159,7 @@ class FeatureAnchor:
 
     def store_anchors(self, model, dataloader, device, prompt_method=None):
         """Store representative features for each class."""
+        was_training = model.training
         model.eval()
         class_features = defaultdict(list)
 
@@ -177,7 +188,10 @@ class FeatureAnchor:
             self.anchors[class_id] = feats[indices]
             self.anchor_labels[class_id] = class_id
 
-    def anchor_loss(self, model, data, device, prompt_method=None):
+        if was_training:
+            model.train()
+
+    def anchor_loss(self, model, data, labels, device, prompt_method=None):
         """Compute feature anchoring loss."""
         if not self.anchors:
             return torch.tensor(0.0, device=device)
@@ -196,8 +210,12 @@ class FeatureAnchor:
         count = 0
 
         for class_id, anchors in self.anchors.items():
+            mask = (labels == class_id)
+            if not mask.any():
+                continue
             anchors = anchors.to(device)
-            dists = torch.cdist(features, anchors)
+            class_features = features[mask]
+            dists = torch.cdist(class_features, anchors)
             min_dists = dists.min(dim=1)[0]
             loss = loss + F.relu(min_dists - self.margin).mean()
             count += 1
@@ -285,8 +303,14 @@ class EPB:
 
         self.task_count = 0
 
-    def compute_losses(self, data, device):
+    def compute_losses(self, data, labels, device, query=None):
         """Compute EPB losses during training.
+
+        Args:
+            data: Input data tensor
+            labels: Ground truth labels
+            device: Computation device
+            query: Pre-computed query from forward(); avoids redundant get_query call
 
         Returns dict with:
         - hec_loss: Hierarchical EWC penalty
@@ -302,18 +326,17 @@ class EPB:
 
         if self.use_fal and self.fal is not None and self.task_count > 0:
             losses['fal_loss'] = self.fal.anchor_loss(
-                self.model, data, device,
+                self.model, data, labels, device,
                 self.prompt_method if self.use_pcf else None
             )
         else:
             losses['fal_loss'] = torch.tensor(0.0, device=device)
 
-        if hasattr(self.model, 'get_query'):
+        if query is None and hasattr(self.model, 'get_query'):
             query = self.model.get_query(data)
-            if hasattr(self.prompt_method, 'get_prompt_loss'):
-                losses['prompt_loss'] = self.prompt_method.get_prompt_loss(query)
-            else:
-                losses['prompt_loss'] = torch.tensor(0.0, device=device)
+
+        if query is not None and hasattr(self.prompt_method, 'get_prompt_loss'):
+            losses['prompt_loss'] = self.prompt_method.get_prompt_loss(query)
         else:
             losses['prompt_loss'] = torch.tensor(0.0, device=device)
 
@@ -324,7 +347,7 @@ class EPB:
 
         Returns:
             outputs: Model outputs
-            prompts: Selected prompts (for external use if needed)
+            query: Pre-computed query (reusable in compute_losses), or None for CNN models
         """
         if hasattr(self.model, 'get_query'):
             query = self.model.get_query(data)
@@ -333,7 +356,7 @@ class EPB:
             else:
                 prompts = self.prompt_method.get_prompt(query)
             outputs = self.model(data, prompts=prompts)
-            return outputs, prompts
+            return outputs, query
         else:
             outputs = self.model(data)
             return outputs, None

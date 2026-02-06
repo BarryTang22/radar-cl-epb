@@ -1,7 +1,7 @@
 """Unified Continual Learning Trainer.
 
-Provides CLTrainer class for training with all 10 CL algorithms:
-- naive, ewc, lwf, replay, derpp, co2l, ease, l2p, coda, dualprompt
+Provides CLTrainer class for training with all 11 CL algorithms:
+- naive, ewc, lwf, replay, derpp, co2l, ease, l2p, coda, dualprompt, epb
 """
 
 import copy
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from .utils import IncrementalClassifier, TaskTracker
 from .methods import (EWC, LwF, BalancedReplayBuffer, BalancedDERPlusPlus,
-                      Co2L, EASE, L2P, CODAPrompt, DualPrompt)
+                      Co2L, EASE, L2P, CODAPrompt, DualPrompt, EPB)
 
 
 # Models that support prompt-based methods (have transformer architecture)
@@ -178,6 +178,43 @@ class CLTrainer:
                 top_k=top_k
             )
             self.cl_params['dualprompt'].to(self.device)
+        elif self.algorithm == 'epb':
+            # Create prompt method for EPB (uses L2P by default)
+            epb_prompt_type = self.config.get('epb_prompt_type', 'l2p')
+            pool_size = self.config.get('pool_size', 20)
+            prompt_length = self.config.get('prompt_length', 5)
+            top_k = self.config.get('top_k', 5)
+
+            if epb_prompt_type == 'coda':
+                n_tasks = self.config.get('n_tasks', 3)
+                ortho_weight = self.config.get('ortho_weight', 0.1)
+                prompt_method = CODAPrompt(
+                    pool_size=pool_size, prompt_length=prompt_length,
+                    embed_dim=self.feature_dim, n_tasks=n_tasks,
+                    ortho_weight=ortho_weight
+                )
+            else:
+                prompt_method = L2P(
+                    pool_size=pool_size, prompt_length=prompt_length,
+                    embed_dim=self.feature_dim, top_k=top_k
+                )
+            prompt_method.to(self.device)
+
+            self.cl_params['epb'] = EPB(
+                model=self.model,
+                prompt_method=prompt_method,
+                embed_dim=self.feature_dim,
+                use_hec=self.config.get('use_hec', True),
+                ewc_lambda=self.config.get('epb_ewc_lambda', 500),
+                fisher_ema=self.config.get('epb_fisher_ema', 0.7),
+                use_pcf=self.config.get('use_pcf', True),
+                use_fal=self.config.get('use_fal', False),
+                num_anchors_per_class=self.config.get('num_anchors_per_class', 10),
+                anchor_margin=self.config.get('anchor_margin', 0.5),
+                fal_lambda=self.config.get('fal_lambda', 0.1),
+                use_replay=self.config.get('epb_use_replay', False),
+                replay_buffer_size=buffer_size,
+            )
 
     def _setup_optimizer(self, lr):
         """Setup optimizer with algorithm-specific parameters."""
@@ -192,6 +229,9 @@ class CLTrainer:
             params = list(self.model.parameters()) + list(self.cl_params['coda'].parameters())
         elif self.algorithm == 'dualprompt' and 'dualprompt' in self.cl_params:
             params = list(self.model.parameters()) + list(self.cl_params['dualprompt'].parameters())
+        elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+            epb = self.cl_params['epb']
+            params = list(self.model.parameters()) + list(epb.prompt_method.parameters())
         else:
             params = self.model.parameters()
 
@@ -205,6 +245,8 @@ class CLTrainer:
 
         if self.algorithm == 'coda' and 'coda' in self.cl_params:
             self.cl_params['coda'].train()
+        elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+            self.cl_params['epb'].prompt_method.train()
 
         for batch_idx, (data, labels) in enumerate(dataloader):
             data, labels = data.to(self.device), labels.to(self.device)
@@ -233,6 +275,10 @@ class CLTrainer:
                         prompts = self.cl_params['coda'].get_prompt(query, train=True)
 
                 outputs = self.model(data, prompts=prompts)
+
+            # Handle EPB forward pass
+            elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+                outputs, epb_query = self.cl_params['epb'].forward(data, self.device)
             else:
                 outputs = self.model(data)
 
@@ -300,6 +346,21 @@ class CLTrainer:
                 prompt_loss = self.cl_params['dualprompt'].get_prompt_loss(query)
                 loss += 0.1 * prompt_loss
 
+            # Add EPB losses (HEC + FAL + prompt)
+            elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+                epb = self.cl_params['epb']
+                epb_losses = epb.compute_losses(data, labels, self.device, query=epb_query)
+                loss += epb_losses['hec_loss'] + epb_losses['fal_loss'] + epb_losses['prompt_loss']
+                # Replay
+                if epb.use_replay:
+                    replay_out, replay_y, _ = epb.get_replay_batch(data.size(0), self.device)
+                    if replay_out is not None:
+                        if active_classes is not None and inc_classifier is not None:
+                            replay_masked = inc_classifier.get_masked_logits(replay_out, active_classes)
+                        else:
+                            replay_masked = replay_out
+                        loss += criterion(replay_masked, replay_y)
+
             loss.backward()
             optimizer.step()
 
@@ -358,6 +419,8 @@ class CLTrainer:
         prompt_module = None
         if self.algorithm in ['l2p', 'coda', 'dualprompt']:
             prompt_module = self.cl_params.get(self.algorithm)
+        elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+            prompt_module = self.cl_params['epb'].prompt_method
 
         for epoch in range(epochs):
             train_loss, train_acc = self._train_epoch(
@@ -410,6 +473,11 @@ class CLTrainer:
                         prompts = prompt_module.get_prompt(query, train=False)
                     elif self.algorithm == 'dualprompt':
                         prompts = prompt_module.get_prompt(query)
+                    elif self.algorithm == 'epb':
+                        if hasattr(prompt_module, 'select_prompts'):
+                            prompts = prompt_module.select_prompts(query)
+                        else:
+                            prompts = prompt_module.get_prompt(query, train=False)
                     else:
                         prompts = None
                     outputs = self.model(data, prompts=prompts)
@@ -484,6 +552,13 @@ class CLTrainer:
         elif self.algorithm == 'l2p' and 'l2p' in self.cl_params:
             self.cl_params['l2p'].update_task()
 
+        # EPB consolidation (Fisher + anchors + prompt update + replay)
+        if self.algorithm == 'epb' and 'epb' in self.cl_params:
+            epb = self.cl_params['epb']
+            epb.consolidate(train_loader, self.device)
+            if epb.use_replay:
+                epb.add_to_replay(train_loader, task_classes)
+
     def evaluate_all_tasks(self, test_loaders, task_classes_list):
         """Evaluate on all seen tasks.
 
@@ -498,6 +573,8 @@ class CLTrainer:
         prompt_module = None
         if self.algorithm in ['l2p', 'coda', 'dualprompt']:
             prompt_module = self.cl_params.get(self.algorithm)
+        elif self.algorithm == 'epb' and 'epb' in self.cl_params:
+            prompt_module = self.cl_params['epb'].prompt_method
 
         accuracies = []
         for test_loader, task_classes in zip(test_loaders, task_classes_list):
