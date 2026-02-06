@@ -245,7 +245,7 @@ class EPB:
         ewc_lambda=500,
         fisher_ema=0.7,
         use_pcf=True,
-        use_fal=True,
+        use_fal=False,
         num_anchors_per_class=10,
         anchor_margin=0.5,
         fal_lambda=0.1,
