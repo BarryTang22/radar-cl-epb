@@ -391,7 +391,7 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
     # Calculate buffer size
     total_train_samples = sum(len(t['train'].dataset) for t in task_data)
     buffer_size = max(10, int(buffer_ratio * total_train_samples))
-    if algorithm in ['replay', 'derpp']:
+    if algorithm in ['replay', 'derpp', 'pgsu']:
         print(f"Buffer: {buffer_ratio*100:.0f}% of {total_train_samples} samples = {buffer_size}")
 
     # Initialize trainer and evaluator
@@ -428,12 +428,11 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         # PGSU hyperparameters
         'pgsu_min_replay': 0.1,
         'pgsu_max_replay': 0.5,
-        'pgsu_buffer_size': 300,
-        'pgsu_k_min': 2,
+        'pgsu_k_min': 4,
         'pgsu_k_max': 16,
-        'pgsu_r_adp_min': 8,
+        'pgsu_r_adp_min': 16,
         'pgsu_r_adp_max': 64,
-        'pgsu_alpha_min': 0.1,
+        'pgsu_alpha_min': 0.3,
         'pgsu_alpha_max': 1.0,
         'pgsu_lambda_p': 0.1,
         'pgsu_cnn_query_dim': 128,
@@ -472,7 +471,7 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         elif algorithm == 'epb' and 'epb' in trainer.cl_params:
             prompt_method = 'epb'
             prompt_module = trainer.cl_params['epb'].prompt_method
-        elif algorithm == 'pgsu' and 'pgsu' in trainer.cl_params:
+        elif algorithm == 'pgsu' and 'pgsu' in trainer.cl_params and task_idx > 0:
             pgsu = trainer.cl_params['pgsu']
             if pgsu.deployment_path == 'transformer' and 'pgsu_prompt' in trainer.cl_params:
                 prompt_method = 'pgsu'
@@ -483,11 +482,19 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         # Evaluate on all tasks seen so far
         for j in range(task_idx + 1):
             prev_task_classes = task_data[j]['classes'] if is_class_incr else None
+            # PGSU: task 0 was trained with standard forward (no wrapper/prompts)
+            eval_cnn_wrapper = cnn_wrapper
+            eval_prompt_module = prompt_module
+            eval_prompt_method = prompt_method
+            if algorithm == 'pgsu' and j == 0:
+                eval_cnn_wrapper = None
+                eval_prompt_module = None
+                eval_prompt_method = None
             test_acc = evaluator.evaluate_task(
                 model, task_data[j]['test'], task_idx, j, device,
                 task_classes=prev_task_classes, ease=ease,
-                prompt_module=prompt_module, prompt_method=prompt_method,
-                cnn_wrapper=cnn_wrapper
+                prompt_module=eval_prompt_module, prompt_method=eval_prompt_method,
+                cnn_wrapper=eval_cnn_wrapper
             )
             print(f"    Test Acc (Task {j + 1}): {test_acc:.2f}%")
 
@@ -513,6 +520,42 @@ def run_benchmark(dataset_name, setting, algorithm, epochs, seed, device, log_di
         'acc_matrix': acc_matrix[:len(task_data), :len(task_data)].tolist(),
         **metrics
     }
+
+    # Log PGSU novelty signals and derived controls per task
+    if algorithm == 'pgsu' and 'pgsu' in trainer.cl_params:
+        pgsu = trainer.cl_params['pgsu']
+        n = len(pgsu.task_centroids)
+        novelties = []
+        lora_ranks = []
+        adapter_widths = []
+        adapter_alphas = []
+        replay_ratios = []
+        # Task 0 is always maximally novel (no prior centroids)
+        for t in range(n):
+            if t == 0:
+                nu = 1.0
+            else:
+                sims = [
+                    torch.nn.functional.cosine_similarity(
+                        pgsu.task_centroids[t].unsqueeze(0),
+                        pgsu.task_centroids[j].unsqueeze(0), dim=1
+                    ).item()
+                    for j in range(t)
+                ]
+                nu = max(0.0, min(1.0, 1.0 - max(sims)))
+            novelties.append(round(nu, 4))
+            lora_ranks.append(pgsu.get_lora_rank(nu))
+            adapter_widths.append(pgsu.get_adapter_width(nu))
+            adapter_alphas.append(round(pgsu.get_adapter_alpha(nu), 4))
+            replay_ratios.append(round(pgsu.get_replay_ratio(nu), 4))
+        result['pgsu_controls'] = {
+            'deployment_path': pgsu.deployment_path,
+            'novelty': novelties,
+            'lora_rank': lora_ranks,
+            'adapter_width': adapter_widths,
+            'adapter_alpha': adapter_alphas,
+            'replay_ratio': replay_ratios,
+        }
     with open(log_file, 'w') as f:
         json.dump(result, f, indent=2)
 

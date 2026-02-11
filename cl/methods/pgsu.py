@@ -166,33 +166,36 @@ class PGSU:
 
 
 def compute_task_centroid(model, dataloader, device, cnn_wrapper=None):
-    """Compute mean query vector for a task's data.
+    """Compute mean feature vector for a task's data.
+
+    For CNN path: uses model.get_features() (frozen 512-dim backbone features)
+    so all centroids live in the same fixed space across tasks.
+    For transformer path: uses model.get_query() (part of frozen backbone).
 
     Args:
         model: The base model
         dataloader: Task data loader
         device: Computation device
-        cnn_wrapper: Optional CNNPGSUWrapper for CNN path
+        cnn_wrapper: If not None, signals CNN path (uses backbone features)
     """
     was_training = model.training
     model.eval()
-    if cnn_wrapper is not None:
-        cnn_wrapper.eval()
     all_queries = []
 
     with torch.no_grad():
         for data, _ in dataloader:
             data = data.to(device)
             if cnn_wrapper is not None:
-                query = cnn_wrapper.get_query(data)
-            else:
+                # CNN path: use frozen backbone features (consistent space across tasks)
+                query = model.get_features(data)
+            elif hasattr(model, 'get_query'):
                 query = model.get_query(data)
+            else:
+                query = model.get_features(data)
             all_queries.append(query)
 
     all_queries = torch.cat(all_queries, dim=0)
     centroid = all_queries.mean(dim=0)
     if was_training:
         model.train()
-        if cnn_wrapper is not None:
-            cnn_wrapper.train()
     return centroid
