@@ -1,4 +1,4 @@
-# radar-cl
+# radar-cl-epb
 
 ## Datasets
 
@@ -86,6 +86,7 @@ model = RadarTransformer(num_classes=5, spatial_encoder='conv3d', depth_dim=10, 
 | `l2p` | Prompt | Learning to Prompt - learnable prompt pool with key-query selection | Transformer |
 | `coda` | Prompt | CODA-Prompt - attention-weighted prompt composition | Transformer |
 | `dualprompt` | Prompt | DualPrompt - general + expert prompts | Transformer |
+| `epb` | Hybrid | Elastic Prompt-Backbone - HEC + PCF + FAL with prompt tuning | All |
 
 ### Usage
 
