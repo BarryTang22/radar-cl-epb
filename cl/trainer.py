@@ -1,7 +1,7 @@
 """Unified Continual Learning Trainer.
 
-Provides CLTrainer class for training with all 12 CL algorithms:
-- naive, ewc, lwf, replay, derpp, co2l, ease, l2p, coda, dualprompt, epb, pgsu
+Provides CLTrainer class for training with all 11 CL algorithms:
+- naive, ewc, lwf, replay, derpp, co2l, ease, l2p, coda, dualprompt, epb
 """
 
 import copy
@@ -12,9 +12,7 @@ import torch.nn.functional as F
 
 from .utils import IncrementalClassifier, TaskTracker
 from .methods import (EWC, LwF, BalancedReplayBuffer, BalancedDERPlusPlus,
-                      Co2L, EASE, L2P, CODAPrompt, DualPrompt, EPB,
-                      PGSU, compute_task_centroid,
-                      LoRAInjector, CNNPGSUWrapper)
+                      Co2L, EASE, L2P, CODAPrompt, DualPrompt, EPB)
 
 
 # Models that support prompt-based methods (have transformer architecture)
@@ -95,12 +93,12 @@ def freeze_backbone(model):
 class CLTrainer:
     """Unified Continual Learning Trainer.
 
-    Supports all 12 CL algorithms through a single interface.
+    Supports all 11 CL algorithms through a single interface.
 
     Args:
         model: The neural network model
         algorithm: CL algorithm name ('naive', 'ewc', 'lwf', 'replay', 'derpp',
-                   'co2l', 'ease', 'l2p', 'coda', 'dualprompt', 'epb', 'pgsu')
+                   'co2l', 'ease', 'l2p', 'coda', 'dualprompt', 'epb')
         device: Device to run computations on
         config: Optional configuration dict with hyperparameters
     """
@@ -217,70 +215,6 @@ class CLTrainer:
                 use_replay=self.config.get('epb_use_replay', False),
                 replay_buffer_size=buffer_size,
             )
-        elif self.algorithm == 'pgsu':
-            # Detect deployment path
-            is_transformer = hasattr(self.model, 'temporal_transformer')
-            deployment_path = 'transformer' if is_transformer else 'cnn'
-
-            # Create PGSU controller with paper hyperparameters
-            pgsu = PGSU(
-                k_min=self.config.get('pgsu_k_min', 2),
-                k_max=self.config.get('pgsu_k_max', 16),
-                r_adp_min=self.config.get('pgsu_r_adp_min', 8),
-                r_adp_max=self.config.get('pgsu_r_adp_max', 64),
-                alpha_min=self.config.get('pgsu_alpha_min', 0.1),
-                alpha_max=self.config.get('pgsu_alpha_max', 1.0),
-                rho_min=self.config.get('pgsu_min_replay', 0.1),
-                rho_max=self.config.get('pgsu_max_replay', 0.5),
-                lambda_p=self.config.get('pgsu_lambda_p', 0.1),
-                buffer_size=self.config.get('buffer_size', 500),
-            )
-            pgsu.deployment_path = deployment_path
-            self.cl_params['pgsu'] = pgsu
-
-            if deployment_path == 'transformer':
-                # Create prompt method (L2P or CODA)
-                pgsu_prompt_type = self.config.get('pgsu_prompt_type', 'l2p')
-                pool_size = self.config.get('pool_size', 20)
-                prompt_length = self.config.get('prompt_length', 5)
-                top_k = self.config.get('top_k', 5)
-                if pgsu_prompt_type == 'coda':
-                    n_tasks = self.config.get('n_tasks', 3)
-                    ortho_weight = self.config.get('ortho_weight', 0.1)
-                    prompt_method = CODAPrompt(
-                        pool_size=pool_size, prompt_length=prompt_length,
-                        embed_dim=self.feature_dim, n_tasks=n_tasks,
-                        ortho_weight=ortho_weight
-                    )
-                else:
-                    prompt_method = L2P(
-                        pool_size=pool_size, prompt_length=prompt_length,
-                        embed_dim=self.feature_dim, top_k=top_k
-                    )
-                prompt_method.to(self.device)
-                self.cl_params['pgsu_prompt'] = prompt_method
-
-                # Create LoRA injector and install hooks
-                k_max = self.config.get('pgsu_k_max', 16)
-                lora_injector = LoRAInjector(self.model, k_max)
-                lora_injector.to(self.device)
-                lora_injector.install_hooks()
-                self.cl_params['pgsu_lora'] = lora_injector
-                pgsu.lora_injector = lora_injector
-
-                # Backbone frozen after task 0 (in after_task), not here
-            else:
-                # CNN path: create wrapper with query, prompt, adapter
-                query_dim = self.config.get('pgsu_cnn_query_dim', 128)
-                r_adp_max = self.config.get('pgsu_r_adp_max', 64)
-                cnn_wrapper = CNNPGSUWrapper(
-                    self.model, feature_dim=self.feature_dim,
-                    query_dim=query_dim, r_adp_max=r_adp_max
-                )
-                cnn_wrapper.to(self.device)
-                self.cl_params['pgsu_cnn_wrapper'] = cnn_wrapper
-                pgsu.cnn_wrapper = cnn_wrapper
-                # Backbone frozen after task 0 (in after_task), not here
 
     def _setup_optimizer(self, lr):
         """Setup optimizer with algorithm-specific parameters."""
@@ -298,33 +232,6 @@ class CLTrainer:
         elif self.algorithm == 'epb' and 'epb' in self.cl_params:
             epb = self.cl_params['epb']
             params = list(self.model.parameters()) + list(epb.prompt_method.parameters())
-        elif self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-
-            if self.current_task_id == 0:
-                # Task 0: train full backbone + classifier
-                return optim.Adam(self.model.parameters(), lr=lr)
-
-            # Task 1+: backbone frozen, train classifier + adapter/prompt only
-            classifier = get_classifier_module(self.model)
-            classifier_params = list(classifier.parameters()) if classifier is not None else []
-            param_groups = [{'params': classifier_params, 'lr': lr}]
-
-            if pgsu.deployment_path == 'transformer':
-                # Prompt params + LoRA params
-                prompt_params = list(self.cl_params['pgsu_prompt'].parameters())
-                lora_params = list(self.cl_params['pgsu_lora'].parameters())
-                param_groups.append({'params': prompt_params, 'lr': lr})
-                param_groups.append({'params': lora_params, 'lr': lr})
-            else:
-                # CNN wrapper params (query, feature prompt, adapter)
-                cnn_wrapper = self.cl_params['pgsu_cnn_wrapper']
-                wrapper_params = list(cnn_wrapper.query_module.parameters()) + \
-                                 list(cnn_wrapper.feature_prompt.parameters()) + \
-                                 list(cnn_wrapper.adapter.parameters())
-                param_groups.append({'params': wrapper_params, 'lr': lr})
-
-            return optim.Adam(param_groups, lr=lr)
         else:
             params = self.model.parameters()
 
@@ -340,21 +247,6 @@ class CLTrainer:
             self.cl_params['coda'].train()
         elif self.algorithm == 'epb' and 'epb' in self.cl_params:
             self.cl_params['epb'].prompt_method.train()
-        elif self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-            if self.current_task_id > 0:
-                # Frozen backbone must stay in eval mode to prevent BN stats drift
-                self.model.eval()
-                if pgsu.deployment_path == 'transformer' and 'pgsu_prompt' in self.cl_params:
-                    self.cl_params['pgsu_prompt'].train()
-                    self.cl_params['pgsu_lora'].train()
-                elif pgsu.deployment_path == 'cnn' and 'pgsu_cnn_wrapper' in self.cl_params:
-                    self.cl_params['pgsu_cnn_wrapper'].train()
-                # Classifier needs train mode (for dropout etc.)
-                classifier = get_classifier_module(self.model)
-                if classifier is not None:
-                    classifier.train()
-            # Task 0: model.train() already set at line 333
 
         for batch_idx, (data, labels) in enumerate(dataloader):
             data, labels = data.to(self.device), labels.to(self.device)
@@ -388,25 +280,6 @@ class CLTrainer:
             elif self.algorithm == 'epb' and 'epb' in self.cl_params:
                 outputs, epb_query = self.cl_params['epb'].forward(data, self.device)
 
-            # Handle PGSU forward pass (dual-path)
-            elif self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-                pgsu = self.cl_params['pgsu']
-                if self.current_task_id == 0:
-                    # Task 0: standard forward (full backbone training)
-                    outputs = self.model(data)
-                elif pgsu.deployment_path == 'transformer' and 'pgsu_prompt' in self.cl_params:
-                    # Transformer path: prompt + LoRA hooks fire automatically
-                    with torch.no_grad():
-                        query = self.model.get_query(data)
-                    prompt_method = self.cl_params['pgsu_prompt']
-                    if hasattr(prompt_method, 'select_prompts'):
-                        prompts = prompt_method.select_prompts(query)
-                    else:
-                        prompts = prompt_method.get_prompt(query, train=True)
-                    outputs = self.model(data, prompts=prompts)
-                elif pgsu.deployment_path == 'cnn' and 'pgsu_cnn_wrapper' in self.cl_params:
-                    # CNN path: wrapper handles query, prompt, adapter
-                    outputs = self.cl_params['pgsu_cnn_wrapper'](data)
             else:
                 outputs = self.model(data)
 
@@ -489,56 +362,6 @@ class CLTrainer:
                             replay_masked = replay_out
                         loss += criterion(replay_masked, replay_y)
 
-            # Add PGSU losses: prompt loss + concatenated mixed CE (Eq. 19-20)
-            # Task 0 uses standard CE only (no adapters/prompts/replay)
-            elif self.algorithm == 'pgsu' and 'pgsu' in self.cl_params and self.current_task_id > 0:
-                pgsu = self.cl_params['pgsu']
-
-                # Prompt loss
-                prompt_loss = torch.tensor(0.0, device=self.device)
-                if pgsu.deployment_path == 'transformer' and 'pgsu_prompt' in self.cl_params:
-                    prompt_method = self.cl_params['pgsu_prompt']
-                    if hasattr(prompt_method, 'get_prompt_loss'):
-                        prompt_loss = pgsu.lambda_p * prompt_method.get_prompt_loss(query)
-                elif pgsu.deployment_path == 'cnn' and 'pgsu_cnn_wrapper' in self.cl_params:
-                    prompt_loss = pgsu.lambda_p * self.cl_params['pgsu_cnn_wrapper'].prompt_loss()
-
-                # Replay with concatenated mixed CE (Eq. 19)
-                replay_bs = pgsu.get_replay_batch_size(data.size(0))
-                if replay_bs > 0:
-                    replay_data, replay_labels = pgsu.replay_buffer.sample(replay_bs)
-                    if replay_data is not None:
-                        replay_data = replay_data.to(self.device)
-                        replay_labels = replay_labels.to(self.device)
-
-                        # Forward replay through same path
-                        if pgsu.deployment_path == 'transformer' and 'pgsu_prompt' in self.cl_params:
-                            with torch.no_grad():
-                                rq = self.model.get_query(replay_data)
-                            pm = self.cl_params['pgsu_prompt']
-                            if hasattr(pm, 'select_prompts'):
-                                rp = pm.select_prompts(rq)
-                            else:
-                                rp = pm.get_prompt(rq, train=True)
-                            replay_outputs = self.model(replay_data, prompts=rp)
-                        else:
-                            replay_outputs = self.cl_params['pgsu_cnn_wrapper'](replay_data)
-
-                        # Concatenate current + replay, mask, compute single mixed CE
-                        all_outputs = torch.cat([outputs, replay_outputs], dim=0)
-                        mixed_labels = torch.cat([labels, replay_labels], dim=0)
-                        if active_classes is not None and inc_classifier is not None:
-                            mixed_outputs = inc_classifier.get_masked_logits(all_outputs, active_classes)
-                        else:
-                            mixed_outputs = all_outputs
-                        # Replace original CE with mixed CE + prompt loss
-                        loss = criterion(mixed_outputs, mixed_labels) + prompt_loss
-                        outputs_masked = mixed_outputs[:data.size(0)]
-                    else:
-                        loss += prompt_loss
-                else:
-                    loss += prompt_loss
-
             loss.backward()
             optimizer.step()
 
@@ -584,28 +407,6 @@ class CLTrainer:
             if ease.task_id > 0:
                 freeze_backbone(self.model)
 
-        # PGSU: compute task novelty and apply controls before optimizer creation
-        if self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-            if task_id > 0:
-                cnn_wrapper = self.cl_params.get('pgsu_cnn_wrapper')
-                centroid = compute_task_centroid(self.model, train_loader, self.device,
-                                                cnn_wrapper=cnn_wrapper)
-                pgsu.compute_task_novelty(centroid)
-                pgsu.apply_novelty_controls()
-                if pgsu.deployment_path == 'transformer':
-                    print(f"    PGSU [transformer]: novelty={pgsu.current_novelty:.4f}, "
-                          f"lora_rank={pgsu.get_lora_rank()}/{pgsu.k_max}, "
-                          f"replay_ratio={pgsu.get_replay_ratio():.4f}")
-                else:
-                    print(f"    PGSU [cnn]: novelty={pgsu.current_novelty:.4f}, "
-                          f"adapter_width={pgsu.get_adapter_width()}/{pgsu.r_adp_max}, "
-                          f"alpha={pgsu.get_adapter_alpha():.4f}, "
-                          f"replay_ratio={pgsu.get_replay_ratio():.4f}")
-                self.cl_params['_pgsu_centroid'] = centroid
-            else:
-                print(f"    PGSU [task 0]: full backbone warmup (no adapters/prompts)")
-
         optimizer = self._setup_optimizer(lr)
         criterion = nn.CrossEntropyLoss()
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
@@ -614,7 +415,6 @@ class CLTrainer:
         best_model_state = None
         best_ease_state = None
         best_prompt_state = None
-        best_pgsu_extra_state = None  # LoRA injector or CNN wrapper
 
         ease = self.cl_params.get('ease') if self.algorithm == 'ease' else None
         prompt_module = None
@@ -622,17 +422,6 @@ class CLTrainer:
             prompt_module = self.cl_params.get(self.algorithm)
         elif self.algorithm == 'epb' and 'epb' in self.cl_params:
             prompt_module = self.cl_params['epb'].prompt_method
-        elif self.algorithm == 'pgsu' and 'pgsu_prompt' in self.cl_params and task_id > 0:
-            prompt_module = self.cl_params['pgsu_prompt']
-
-        # Identify PGSU extra module for state saving
-        pgsu_extra_module = None
-        if self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-            if pgsu.deployment_path == 'transformer' and 'pgsu_lora' in self.cl_params:
-                pgsu_extra_module = self.cl_params['pgsu_lora']
-            elif pgsu.deployment_path == 'cnn' and 'pgsu_cnn_wrapper' in self.cl_params:
-                pgsu_extra_module = self.cl_params['pgsu_cnn_wrapper']
 
         for epoch in range(epochs):
             train_loss, train_acc = self._train_epoch(
@@ -650,8 +439,6 @@ class CLTrainer:
                     best_ease_state = copy.deepcopy(ease.state_dict())
                 if prompt_module is not None and hasattr(prompt_module, 'state_dict'):
                     best_prompt_state = copy.deepcopy(prompt_module.state_dict())
-                if pgsu_extra_module is not None:
-                    best_pgsu_extra_state = copy.deepcopy(pgsu_extra_module.state_dict())
 
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
@@ -659,8 +446,6 @@ class CLTrainer:
             ease.load_state_dict(best_ease_state)
         if best_prompt_state is not None and prompt_module is not None:
             prompt_module.load_state_dict(best_prompt_state)
-        if best_pgsu_extra_state is not None and pgsu_extra_module is not None:
-            pgsu_extra_module.load_state_dict(best_pgsu_extra_state)
 
         return best_val_acc
 
@@ -672,16 +457,6 @@ class CLTrainer:
         if prompt_module is not None and hasattr(prompt_module, 'eval'):
             prompt_module.eval()
 
-        # Put PGSU extra modules in eval mode
-        pgsu_cnn_eval = None
-        if self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-            if pgsu.deployment_path == 'cnn' and 'pgsu_cnn_wrapper' in self.cl_params:
-                pgsu_cnn_eval = self.cl_params['pgsu_cnn_wrapper']
-                pgsu_cnn_eval.eval()
-            if pgsu.deployment_path == 'transformer' and 'pgsu_lora' in self.cl_params:
-                self.cl_params['pgsu_lora'].eval()
-
         correct, total = 0, 0
 
         with torch.no_grad():
@@ -691,9 +466,6 @@ class CLTrainer:
                 if ease is not None and hasattr(self.model, 'get_features'):
                     backbone_features = self.model.get_features(data)
                     outputs = ease(backbone_features, training=False)
-                elif pgsu_cnn_eval is not None:
-                    # CNN PGSU path: use wrapper for inference
-                    outputs = pgsu_cnn_eval(data)
                 elif prompt_module is not None and hasattr(self.model, 'get_query'):
                     query = self.model.get_query(data)
                     if self.algorithm == 'l2p':
@@ -702,7 +474,7 @@ class CLTrainer:
                         prompts = prompt_module.get_prompt(query, train=False)
                     elif self.algorithm == 'dualprompt':
                         prompts = prompt_module.get_prompt(query)
-                    elif self.algorithm in ('epb', 'pgsu'):
+                    elif self.algorithm == 'epb':
                         if hasattr(prompt_module, 'select_prompts'):
                             prompts = prompt_module.select_prompts(query)
                         else:
@@ -788,28 +560,6 @@ class CLTrainer:
             if epb.use_replay:
                 epb.add_to_replay(train_loader, task_classes)
 
-        # PGSU: store centroid, add to balanced replay buffer, update prompt
-        if self.algorithm == 'pgsu' and 'pgsu' in self.cl_params:
-            pgsu = self.cl_params['pgsu']
-            if self.current_task_id == 0:
-                # Freeze backbone after task 0 warmup
-                self.model.freeze_backbone()
-                # Compute centroid from now-trained features
-                cnn_wrapper = self.cl_params.get('pgsu_cnn_wrapper')
-                centroid = compute_task_centroid(self.model, train_loader, self.device,
-                                                cnn_wrapper=cnn_wrapper)
-                pgsu.add_task_centroid(centroid)
-            elif '_pgsu_centroid' in self.cl_params:
-                pgsu.add_task_centroid(self.cl_params['_pgsu_centroid'])
-                del self.cl_params['_pgsu_centroid']
-            # Add task data to balanced replay buffer
-            pgsu.replay_buffer.add_task_data(train_loader, task_classes)
-            # Update prompt method task counter (transformer path only)
-            if pgsu.deployment_path == 'transformer':
-                prompt_method = self.cl_params.get('pgsu_prompt')
-                if prompt_method is not None and hasattr(prompt_method, 'update_task'):
-                    prompt_method.update_task()
-
     def evaluate_all_tasks(self, test_loaders, task_classes_list):
         """Evaluate on all seen tasks.
 
@@ -826,23 +576,10 @@ class CLTrainer:
             prompt_module = self.cl_params.get(self.algorithm)
         elif self.algorithm == 'epb' and 'epb' in self.cl_params:
             prompt_module = self.cl_params['epb'].prompt_method
-        elif self.algorithm == 'pgsu' and 'pgsu_prompt' in self.cl_params:
-            prompt_module = self.cl_params['pgsu_prompt']
 
         accuracies = []
         for task_idx, (test_loader, task_classes) in enumerate(zip(test_loaders, task_classes_list)):
-            # PGSU: task 0 was trained with standard forward (no wrapper/prompts)
-            eval_prompt = prompt_module
-            skip_pgsu_wrapper = False
-            if self.algorithm == 'pgsu' and task_idx == 0:
-                eval_prompt = None
-                # Temporarily hide CNN wrapper so _evaluate uses standard forward
-                if 'pgsu_cnn_wrapper' in self.cl_params:
-                    skip_pgsu_wrapper = True
-                    saved_wrapper = self.cl_params.pop('pgsu_cnn_wrapper')
-            acc = self._evaluate(test_loader, task_classes, ease, eval_prompt)
-            if skip_pgsu_wrapper:
-                self.cl_params['pgsu_cnn_wrapper'] = saved_wrapper
+            acc = self._evaluate(test_loader, task_classes, ease, prompt_module)
             accuracies.append(acc)
 
         return accuracies
